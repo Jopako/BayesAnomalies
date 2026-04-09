@@ -1,24 +1,30 @@
+import sqlite3
 import numpy as np
-import csv
 from datetime import datetime
 
 # ---------------------------
-# 1. LER CSV
+# 1. LER DO SQLITE
 # ---------------------------
+
+DB_PATH = "historico.db"   # caminho para o banco
+
+conn = sqlite3.connect(DB_PATH)
+cur  = conn.cursor()
+
+cur.execute("SELECT data, temp, press, hum FROM leituras ORDER BY data")
+rows = cur.fetchall()
+conn.close()
 
 datas = []
 temp  = []
 press = []
 hum   = []
 
-with open("historico.csv", "r") as f:
-    reader = csv.DictReader(f)
-    for row in reader:
-        data = datetime.strptime(row["data"], "%Y-%m-%d")
-        datas.append(data)
-        temp.append(float(row["temp"]))
-        press.append(float(row["press"]))
-        hum.append(float(row["hum"]))
+for data_str, t, p, h in rows:
+    datas.append(datetime.strptime(data_str, "%Y-%m-%d"))
+    temp.append(t)
+    press.append(p)
+    hum.append(h)
 
 temp  = np.array(temp)
 press = np.array(press)
@@ -31,17 +37,10 @@ X = np.column_stack((temp, press, hum, sin_t, cos_t))
 
 # ---------------------------
 # 2. LABELS SAZONAIS (z-score por época)
-#
-# BUG ORIGINAL: critério fixo (>35 ou <10) nunca era atingido
-# no CSV → y sempre 0 → Bayes nunca via a classe "anomalia".
-#
-# CORREÇÃO: z-score sazonal — cada ponto é comparado com
-# vizinhos de ±WINDOW_LABEL dias. Se qualquer feature passar
-# de Z_THRESH desvios padrão, é marcado como anomalia.
 # ---------------------------
 
-WINDOW_LABEL = 30   # dias de contexto sazonal
-Z_THRESH     = 2.0  # desvios padrão para considerar anomalia
+WINDOW_LABEL = 30
+Z_THRESH     = 2.0
 
 y = np.zeros(len(X))
 
@@ -92,18 +91,9 @@ def predict_bayes(x, classes, mean, var, prior, const):
 
 # ---------------------------
 # 4. GRAU VIA Z-SCORE (abordagem híbrida)
-#
-# BUG DESCOBERTO: o Bayes falha quando não há anomalias reais
-# na janela temporal do ponto novo. Adicionalmente, sin/cos têm
-# variância ≈ 0 dentro da janela sazonal, o que domina o cálculo
-# e torna as classes indistinguíveis para o modelo.
-#
-# SOLUÇÃO: z-score sazonal (70%) + Bayes apenas com features
-# meteorológicas sem sin/cos (30%).
 # ---------------------------
 
 def zscore_grau(valor, referencia, threshold=Z_THRESH):
-    """Converte z-score em grau de anomalia [0,1] via sigmoid."""
     z    = abs(valor - np.mean(referencia)) / (np.std(referencia) + 1e-6)
     grau = 1 / (1 + np.exp(-(z - threshold)))
     return z, grau
@@ -117,7 +107,7 @@ dia_novo  = nova_data.timetuple().tm_yday
 sin_novo  = np.sin(2 * np.pi * dia_novo / 365)
 cos_novo  = np.cos(2 * np.pi * dia_novo / 365)
 
-novo_dado = np.array([20, 1015, 58, sin_novo, cos_novo])
+novo_dado = np.array([21, 1015, 58, sin_novo, cos_novo])
 
 # ---------------------------
 # 6. FILTRAR HISTÓRICO SAZONAL
@@ -136,11 +126,9 @@ t_ctx = temp[indices]
 p_ctx = press[indices]
 h_ctx = hum[indices]
 
-# Treino Bayes sem sin/cos (variância nula na janela os inutiliza)
 X_filtrado = X[indices, :3]
 y_filtrado = y[indices]
 
-# Garantia de 2 classes no treino
 if len(np.unique(y_filtrado)) < 2:
     classe_faltando = 1.0 if 0.0 in np.unique(y_filtrado) else 0.0
     idx_extra = np.where(y == classe_faltando)[0][:5]
@@ -168,6 +156,7 @@ classe_final = 1 if grau_final >= 0.5 else 0
 # ---------------------------
 
 print("=" * 52)
+print(f"  Fonte    : SQLite → {DB_PATH}")
 print(f"  Data     : {nova_data.strftime('%Y-%m-%d')}")
 print(f"  Leitura  : Temp={novo_dado[0]}°C | Press={novo_dado[1]} hPa | Hum={novo_dado[2]}%")
 print(f"  Registros: {len(X_filtrado)} (janela ±{WINDOW_PRED} dias)")
