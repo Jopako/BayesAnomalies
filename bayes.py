@@ -6,7 +6,7 @@ from datetime import datetime
 # 1. LER DO SQLITE
 # ---------------------------
 
-DB_PATH = "historico.db"   # caminho para o banco
+DB_PATH = "historico.db"
 
 conn = sqlite3.connect(DB_PATH)
 cur  = conn.cursor()
@@ -31,9 +31,7 @@ press = np.array(press)
 hum   = np.array(hum)
 dia   = np.array([d.timetuple().tm_yday for d in datas])
 
-sin_t = np.sin(2 * np.pi * dia / 365)
-cos_t = np.cos(2 * np.pi * dia / 365)
-X = np.column_stack((temp, press, hum, sin_t, cos_t))
+X_bayes = np.column_stack((temp, press, hum))
 
 # ---------------------------
 # 2. LABELS SAZONAIS (z-score por época)
@@ -42,12 +40,12 @@ X = np.column_stack((temp, press, hum, sin_t, cos_t))
 WINDOW_LABEL = 30
 Z_THRESH     = 2.0
 
-y = np.zeros(len(X))
+y = np.zeros(len(X_bayes))
 
-for i in range(len(X)):
-    viz = [j for j in range(len(X)) if j != i and abs(dia[j] - dia[i]) <= WINDOW_LABEL]
+for i in range(len(X_bayes)):
+    viz = [j for j in range(len(X_bayes)) if j != i and abs(dia[j] - dia[i]) <= WINDOW_LABEL]
     if len(viz) < 3:
-        viz = [j for j in range(len(X)) if j != i]
+        viz = [j for j in range(len(X_bayes)) if j != i]
 
     z_t = abs(temp[i]  - np.mean(temp[viz]))  / (np.std(temp[viz])  + 1e-6)
     z_p = abs(press[i] - np.mean(press[viz])) / (np.std(press[viz]) + 1e-6)
@@ -90,13 +88,11 @@ def predict_bayes(x, classes, mean, var, prior, const):
     return max(probs, key=probs.get), probs, probs.get(1.0, 0.0)
 
 # ---------------------------
-# 4. GRAU VIA Z-SCORE (abordagem híbrida)
+# 4. SIGMOID (usado pelo z-score)
 # ---------------------------
 
-def zscore_grau(valor, referencia, threshold=Z_THRESH):
-    z    = abs(valor - np.mean(referencia)) / (np.std(referencia) + 1e-6)
-    grau = 1 / (1 + np.exp(-(z - threshold)))
-    return z, grau
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
 
 # ---------------------------
 # 5. NOVO DADO
@@ -104,80 +100,141 @@ def zscore_grau(valor, referencia, threshold=Z_THRESH):
 
 nova_data = datetime(2024, 7, 18)
 dia_novo  = nova_data.timetuple().tm_yday
-sin_novo  = np.sin(2 * np.pi * dia_novo / 365)
-cos_novo  = np.cos(2 * np.pi * dia_novo / 365)
 
-novo_dado = np.array([21, 1015, 58, sin_novo, cos_novo])
+# Apenas temp, press, hum para o Bayes
+novo_dado_bayes = np.array([33.0, 1009.0, 76.0])
 
 # ---------------------------
 # 6. FILTRAR HISTÓRICO SAZONAL
 # ---------------------------
 
-WINDOW_PRED = 45
+WINDOW_PRED = 28
 
+window_used = WINDOW_PRED
 indices = [
     i for i, d in enumerate(datas)
     if abs(d.timetuple().tm_yday - dia_novo) <= WINDOW_PRED
 ]
 if len(indices) < 5:
     indices = list(range(len(datas)))
+    window_used = None
 
 t_ctx = temp[indices]
 p_ctx = press[indices]
 h_ctx = hum[indices]
 
-X_filtrado = X[indices, :3]
-y_filtrado = y[indices]
+X_filtrado_bayes = X_bayes[indices, :]
+y_filtrado       = y[indices]
 
+# Se a janela sazonal não contém as duas classes, expande progressivamente
 if len(np.unique(y_filtrado)) < 2:
-    classe_faltando = 1.0 if 0.0 in np.unique(y_filtrado) else 0.0
-    idx_extra = np.where(y == classe_faltando)[0][:5]
-    if len(idx_extra) > 0:
-        X_filtrado = np.vstack([X_filtrado, X[idx_extra, :3]])
-        y_filtrado = np.concatenate([y_filtrado, y[idx_extra]])
+    for extra in (30, 60, 90, 120, 180):
+        indices_try = [
+            i for i, d in enumerate(datas)
+            if abs(d.timetuple().tm_yday - dia_novo) <= (WINDOW_PRED + extra)
+        ]
+        if len(indices_try) < 5:
+            continue
+        y_tmp = y[indices_try]
+        if len(np.unique(y_tmp)) >= 2:
+            window_used      = WINDOW_PRED + extra
+            indices          = indices_try
+            t_ctx            = temp[indices]
+            p_ctx            = press[indices]
+            h_ctx            = hum[indices]
+            X_filtrado_bayes = X_bayes[indices, :]
+            y_filtrado       = y_tmp
+            break
 
 # ---------------------------
 # 7. TREINAR E PREDIZER
 # ---------------------------
 
-classes, mean, var, prior, const = train_bayes(X_filtrado, y_filtrado)
-_, probs_bayes, grau_bayes = predict_bayes(novo_dado[:3], classes, mean, var, prior, const)
+classes, mean, var, prior, const = train_bayes(X_filtrado_bayes, y_filtrado)
+_, probs_bayes, grau_bayes = predict_bayes(novo_dado_bayes, classes, mean, var, prior, const)
 
-z_t, g_t = zscore_grau(novo_dado[0], t_ctx)
-z_p, g_p = zscore_grau(novo_dado[1], p_ctx)
-z_h, g_h = zscore_grau(novo_dado[2], h_ctx)
+# Z-scores do novo dado em relação ao contexto sazonal
+z_t_novo = abs(novo_dado_bayes[0] - np.mean(t_ctx)) / (np.std(t_ctx) + 1e-6)
+z_p_novo = abs(novo_dado_bayes[1] - np.mean(p_ctx)) / (np.std(p_ctx) + 1e-6)
+z_h_novo = abs(novo_dado_bayes[2] - np.mean(h_ctx)) / (np.std(h_ctx) + 1e-6)
+z_max    = max(z_t_novo, z_p_novo, z_h_novo)
 
-grau_zscore = max(g_t, g_p, g_h)
-grau_final  = 0.70 * grau_zscore + 0.30 * grau_bayes
-classe_final = 1 if grau_final >= 0.5 else 0
+# Grau z-score normalizado em [0, 1] (referência, não usado na decisão principal)
+grau_zscore = float(sigmoid(z_max - Z_THRESH))
 
 # ---------------------------
-# 8. RESULTADO
+# 8. CLASSIFICAÇÃO FINAL
+#    Bayes é soberano.
+#    Z-score só entra como desempate na zona de atenção (Bayes incerto).
 # ---------------------------
 
-print("=" * 52)
+ZONA_NORMAL   = 0.3   # abaixo → Normal com confiança
+ZONA_ANOMALIA = 0.7   # acima  → Anômalo com confiança
+Z_CONFIRMA    = 3.0   # z alto na zona de atenção → confirma anomalia
+Z_DESCARTA    = 1.0   # z baixo na zona de atenção → provável falso positivo
+
+# grau_final sempre reflete o Bayes (sem distorção pelo z-score)
+grau_final = float(grau_bayes)
+
+if grau_bayes < ZONA_NORMAL:
+    categoria = "Normal"
+    detalhe   = "Bayes confiante (abaixo da zona de atenção)"
+
+elif grau_bayes >= ZONA_ANOMALIA:
+    categoria = "Anômalo"
+    detalhe   = "Bayes confiante (acima da zona de atenção)"
+
+else:
+    # Zona de atenção: Bayes incerto → Z-score entra como desempate
+    if z_max >= Z_CONFIRMA:
+        categoria = "Anômalo"
+        detalhe   = "Bayes incerto + Z-score alto → positivo confirmado"
+    elif z_max <= Z_DESCARTA:
+        categoria = "Normal"
+        detalhe   = "Bayes incerto + Z-score baixo → provável falso positivo"
+    else:
+        categoria = "Atenção"
+        detalhe   = "Bayes incerto, Z-score intermediário → revisar manualmente"
+
+# ---------------------------
+# 9. RESULTADO
+# ---------------------------
+
+print("=" * 56)
 print(f"  Fonte    : SQLite → {DB_PATH}")
 print(f"  Data     : {nova_data.strftime('%Y-%m-%d')}")
-print(f"  Leitura  : Temp={novo_dado[0]}°C | Press={novo_dado[1]} hPa | Hum={novo_dado[2]}%")
-print(f"  Registros: {len(X_filtrado)} (janela ±{WINDOW_PRED} dias)")
-print("-" * 52)
-print(f"  Contexto histórico (±{WINDOW_PRED} dias):")
-print(f"    Temp  : {np.mean(t_ctx):.1f}°C ± {np.std(t_ctx):.1f}°C   z={z_t:.2f}σ")
-print(f"    Press : {np.mean(p_ctx):.1f} hPa ± {np.std(p_ctx):.1f}  z={z_p:.2f}σ")
-print(f"    Hum   : {np.mean(h_ctx):.1f}% ± {np.std(h_ctx):.1f}%    z={z_h:.2f}σ")
-print("-" * 52)
-print(f"  Grau z-score  : {grau_zscore*100:.1f}%  (peso 70%)")
-print(f"  Grau Bayes    : {grau_bayes*100:.1f}%  (peso 30%)")
-print(f"  Grau final    : {grau_final*100:.1f}%")
-print("-" * 52)
-print(f"  Classificação : {'Anômalo' if classe_final == 1 else 'Normal'} ({classe_final})")
-
-if grau_final < 0.3:
-    print("  Status        : 🟢 Normal")
-elif grau_final < 0.7:
-    print("  Status        : 🟡 Atenção")
+print(f"  Leitura  : Temp={novo_dado_bayes[0]}°C | Press={novo_dado_bayes[1]} hPa | Hum={novo_dado_bayes[2]}%")
+if window_used is None:
+    print(f"  Registros: {len(X_filtrado_bayes)} (toda a série histórica)")
 else:
-    print("  Status        : 🔴 Anomalia forte")
-
-print("=" * 52)
+    print(f"  Registros: {len(X_filtrado_bayes)} (janela sazonal ±{window_used} dias)")
+print("-" * 56)
+if window_used is None:
+    print("  Contexto histórico (toda a série):")
+else:
+    print(f"  Contexto histórico (±{window_used} dias):")
+print(f"    Temp  : {np.mean(t_ctx):.1f}°C ± {np.std(t_ctx):.1f}°C")
+print(f"    Press : {np.mean(p_ctx):.1f} hPa ± {np.std(p_ctx):.1f}")
+print(f"    Hum   : {np.mean(h_ctx):.1f}% ± {np.std(h_ctx):.1f}%")
+print("-" * 56)
+print(f"  [BAYES - PRINCIPAL]")
+print(f"    P(Normal)   : {probs_bayes.get(0.0, 0)*100:.1f}%")
+print(f"    P(Anomalia) : {grau_bayes*100:.1f}%")
+print(f"    Grau final  : {grau_final*100:.1f}%")
+print("-" * 56)
+print(f"  [Z-SCORE - SECUNDÁRIO]")
+print(f"    T={z_t_novo:.2f} | P={z_p_novo:.2f} | H={z_h_novo:.2f}  (max={z_max:.2f})")
+print(f"    Grau Z-Score : {grau_zscore*100:.1f}%")
+zona_bayes = (
+    "Confiante Normal"   if grau_bayes < ZONA_NORMAL   else
+    "Confiante Anômalo"  if grau_bayes >= ZONA_ANOMALIA else
+    "Incerto (atenção)"
+)
+print(f"    Zona Bayes   : {zona_bayes}")
+usado = "Sim (desempate)" if ZONA_NORMAL <= grau_bayes < ZONA_ANOMALIA else "Não (Bayes confiante)"
+print(f"    Z-score usado: {usado}")
+print("-" * 56)
+print(f"  Classificação : {categoria}")
+print(f"  Motivo        : {detalhe}")
+print("=" * 56)
 print(f"\n  (Dataset: {n_normais} normais + {n_anomalias} anomalias históricas)")
